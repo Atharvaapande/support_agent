@@ -16,6 +16,13 @@ service_account*.json
 
 # Local state / runtime data
 last_history_id.txt
+graph.png
+
+# Databases & Vector Stores
+db/
+*.sqlite
+*.sqlite3
+chroma/
 
 # ===============================
 # Python & Virtual Environments

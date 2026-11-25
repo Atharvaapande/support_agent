@@ -1,6 +1,8 @@
 import os
 import base64
 import json
+import time
+import re
 from fastapi import FastAPI, Request
 from googleapiclient.errors import HttpError
 from registerGmail import get_gmail_service
@@ -36,7 +38,7 @@ def save_last_history_id(history_id: str | int):
 
 
 def extract_email_body(payload: dict) -> str:
-    """Recursively extracts plain text body (or html as fallback) from message payload."""
+    """Recursively extracts plain text body (or stripped html) and caps length."""
     plain_parts = []
     html_parts = []
 
@@ -61,10 +63,17 @@ def extract_email_body(payload: dict) -> str:
     _walk(payload)
 
     if plain_parts:
-        return "\n".join(plain_parts).strip()
+        text = "\n".join(plain_parts).strip()
     elif html_parts:
-        return "\n".join(html_parts).strip()
-    return ""
+        # Strip HTML tags and collapse whitespace to prevent huge raw HTML blobs
+        raw_html = "\n".join(html_parts)
+        text = re.sub(r"<[^>]+>", " ", raw_html)
+        text = re.sub(r"\s+", " ", text).strip()
+    else:
+        text = ""
+
+    # Truncate to 3,000 characters to stay safely below Groq token limits
+    return text[:3000]
 
 
 # =====================================================================
@@ -187,9 +196,34 @@ async def gmail_webhook(request: Request):
                     .execute()
                 )
 
+                labels = full_msg.get("labelIds", [])
+
+                # 1. Skip if the message was sent by your agent (outgoing)
+                if "SENT" in labels:
+                    print("Skipping outgoing sent email.")
+                    continue
+
+                # 2. Skip promotional, social, forum, and newsletter emails
+                skip_categories = {"CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_UPDATES", "CATEGORY_FORUMS"}
+                if set(labels).intersection(skip_categories):
+                    print(f"Skipping promotional/social email ({msg_id}).")
+                    continue
+
+                # 3. Skip emails received more than 10 minutes ago
+                msg_time_ms = int(full_msg.get("internalDate", 0))
+                now_ms = int(time.time() * 1000)
+                if (now_ms - msg_time_ms) > (10 * 60 * 1000):
+                    print(f"Skipping old email received while offline ({msg_id}).")
+                    continue
+
                 msg_payload = full_msg.get("payload", {})
                 headers_list = msg_payload.get("headers", [])
                 headers = {h["name"].lower(): h["value"] for h in headers_list}
+
+                # 4. Skip if the 'from' address is your own support email
+                if email_address and email_address.lower() in headers.get("from", "").lower():
+                    print("Skipping self-sent email.")
+                    continue
 
                 email_data = {
                     "id": msg_id,

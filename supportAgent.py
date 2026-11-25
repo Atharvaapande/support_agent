@@ -22,8 +22,10 @@ class EmailState(TypedDict):
     is_query: Optional[bool]
     query: Optional[str]
     rag_ans: Optional[str]
+    is_relevant: Optional[bool]
+    retry_count: Optional[int]
     response_mail: Dict[str, Any]
-    messages:List[Dict[str, Any]] 
+    messages: List[Dict[str, Any]] 
 
 load_dotenv()
 llm = ChatGroq(model="openai/gpt-oss-120b", api_key=os.getenv('GROQ_API'),temperature=0)
@@ -122,23 +124,88 @@ def replyGenerator(state: EmailState):
     }
 
 def ragAgent(state: EmailState):
-    """this agent help to retrive info from the vector db and generate a reply for the query email"""
-    prompt = f"""
-    extract the user query from the query email below and return me that query -
-    email -
-    email subject: {state['email']['subject']},
-    from: {state['email']['from']},
-    body: {state['email']['body']}
-    """
+    """Retrieves info from the vector db using the query (or extracts query first)"""
+    query = state.get("query")
+    if not query:
+        prompt = f"""
+        Extract the user's primary question or query from this email.
+        Return ONLY the question/query itself in 1 sentence.
+        
+        email subject: {state['email']['subject']},
+        from: {state['email']['from']},
+        body: {state['email']['body']}
+        """
+        res = llm.invoke([HumanMessage(content=prompt)])
+        query = res.content.strip()
 
-    msg = [HumanMessage(content=prompt)]
-    res = llm.invoke(msg)
-    query = res.content.strip()
-    rag_ans=query_engine.query(query)    
+    print(f"\n🔍 Searching Knowledge Base for: '{query}'")
+    rag_response = query_engine.query(query)
+    
     return {
-        "query":query,
-        "rag_ans":rag_ans
+        "query": query,
+        "rag_ans": str(rag_response)
     }
+
+def grade_relevance(state: EmailState):
+    """Evaluates if the retrieved knowledge base answer actually answers the query"""
+    query = state.get("query", "")
+    rag_ans = state.get("rag_ans", "")
+    print(f"\n\n{rag_ans}")
+
+    prompt = f"""
+    You are an evaluator grading whether retrieved information answers a user question.
+    
+    User Query: {query}
+    Retrieved Context: {rag_ans}
+    
+    Does the retrieved context provide a relevant, helpful answer to the user query?
+    Answer ONLY with 'yes' or 'no'.
+    """
+    res = llm.invoke([HumanMessage(content=prompt)])
+    answer = res.content.strip().lower()
+    is_relevant = "yes" in answer
+
+    print(f"📊 Relevance Check: {'PASS (Relevant)' if is_relevant else 'FAIL (Not Relevant)'}")
+    return {"is_relevant": is_relevant}
+
+def rewrite_query(state: EmailState):
+    """Rewrites query to be better suited for vector search and increments retry count"""
+    current_retries = state.get("retry_count") or 0
+    new_retries = current_retries + 1
+
+    prompt = f"""
+    The previous vector search for: "{state.get('query')}" failed to find relevant answers in our knowledge base.
+    
+    Original email subject: {state['email']['subject']}
+    Original email body: {state['email']['body']}
+    
+    Rewrite this query into 2-5 specific technical keywords or a clearer reformulated question suitable for searching documentation on Computer Networks.
+    Return ONLY the rewritten query text.
+    """
+    res = llm.invoke([HumanMessage(content=prompt)])
+    new_query = res.content.strip()
+
+    print(f"🔄 Self-Correcting: Rewrote query to: '{new_query}' (Attempt {new_retries}/2)")
+    return {"query": new_query, "retry_count": new_retries}
+
+def fallback_agent(state: EmailState):
+    """Fallback when knowledge base does not have the answer after retries"""
+    print("⚠️ Max retries reached: Knowledge base does not contain the answer.")
+    fallback_text = (
+        "Thank you for reaching out. Our automated documentation currently does not have the specific answer "
+        "to your question. I have forwarded your request to our engineering support team, and one of our "
+        "specialists will review it and get back to you shortly."
+    )
+    return {"rag_ans": fallback_text}
+
+def crag_route(state: EmailState) -> str:
+    """Routes based on relevance and retry threshold"""
+    if state.get("is_relevant"):
+        return "generate"
+    elif (state.get("retry_count") or 0) >= 2:
+        return "fallback"
+    else:
+        return "rewrite"
 
 def send_reply(state: EmailState):
     service = get_gmail_service()
@@ -206,26 +273,44 @@ query_engine_tool = QueryEngineTool.from_defaults(
 
 # graph
 builder.add_node('read_mail', read_mail)
-builder.add_node('checkIsSpam',checkIsSpam)
-builder.add_node('spamHandler',spamHandler)
-builder.add_node('replyGenerator',replyGenerator)
-builder.add_node('ragAgent',ragAgent)
-builder.add_node("send_reply", send_reply)
+builder.add_node('checkIsSpam', checkIsSpam)
+builder.add_node('spamHandler', spamHandler)
+builder.add_node('ragAgent', ragAgent)
+builder.add_node('grade_relevance', grade_relevance)
+builder.add_node('rewrite_query', rewrite_query)
+builder.add_node('fallback_agent', fallback_agent)
+builder.add_node('replyGenerator', replyGenerator)
+builder.add_node('send_reply', send_reply)
 
-builder.add_edge(START,'read_mail')
-builder.add_edge('read_mail',"checkIsSpam")
+builder.add_edge(START, 'read_mail')
+builder.add_edge('read_mail', 'checkIsSpam')
+
 builder.add_conditional_edges(
     'checkIsSpam',
     route,
     {
-        "rag":"ragAgent",
-        "gen":"replyGenerator",
-        "spam":"spamHandler"     
+        "rag": "ragAgent",
+        "gen": "replyGenerator",
+        "spam": "spamHandler"     
     }
 )
-builder.add_edge("ragAgent", "replyGenerator")
+
+# Corrective RAG Evaluation & Loop
+builder.add_edge("ragAgent", "grade_relevance")
+builder.add_conditional_edges(
+    "grade_relevance",
+    crag_route,
+    {
+        "generate": "replyGenerator",
+        "rewrite": "rewrite_query",
+        "fallback": "fallback_agent"
+    }
+)
+builder.add_edge("rewrite_query", "ragAgent")        # 🔁 Loop back to ragAgent!
+builder.add_edge("fallback_agent", "replyGenerator")
+
 builder.add_edge("replyGenerator", "send_reply")
-builder.add_edge("send_reply",END)
+builder.add_edge("send_reply", END)
 builder.add_edge("spamHandler", END)
 
 agent_app = builder.compile()
