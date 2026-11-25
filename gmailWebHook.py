@@ -4,6 +4,7 @@ import json
 from fastapi import FastAPI, Request
 from googleapiclient.errors import HttpError
 from registerGmail import get_gmail_service
+from supportAgent import run_agent
 
 app = FastAPI()
 
@@ -91,6 +92,7 @@ def process_email_with_ai(email_data: dict):
     print(f"Snippet: {email_data['snippet']}")
     print(f"Body:\n{email_data['body'][:300]}...")  # print first 300 chars
     print("=" * 60 + "\n")
+    run_agent(email_data)
 
     # >>> Put your LangGraph / LlamaIndex / Agent workflow code here <<<
 
